@@ -1,0 +1,307 @@
+OpenAI Codex v0.80.0 (research preview)
+--------
+workdir: /Users/bvt/work/ClickDBA/q1-fhir
+model: gpt-5.2
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: auto
+session id: 019bac88-c343-7381-b7e6-e33960c7b367
+--------
+user
+You are reducing a set of partial summaries into a smaller summary.
+Rules:
+- Output MUST be <= 650 words.
+- Keep a practical “how-to” shape when the inputs contain steps/settings/examples.
+- Prefer actionable steps, settings, and example SQL; minimize design rationale.
+- De-duplicate repeated points.
+- Preserve concrete numbers/dates when present.
+- Do not mention that you are reducing or that there were chunks.
+- Output only the summary text.
+Formatting rules:
+- Keep markdown headings if helpful.
+- Keep fenced code blocks when present; keep them short.
+- Prefer to include a short `## Verification` section if inputs mention how to check progress/impact.
+
+INPUT SUMMARIES:
+--- summary 1 ---
+## Practical notes
+- ClickHouse supports SQL-style updates via `ALTER TABLE ... UPDATE` (mutation-based) since 2018.
+- Classic mutations rewrite affected column files for matching parts; unchanged columns may be hard-linked (no data copy for those columns).
+- By default, `ALTER TABLE ... UPDATE` runs asynchronously; ClickHouse may fuse multiple updates into a single mutation.
+- `DELETE` can be implemented as a “lightweight delete” by updating a mask column `_row_exists = 0`; rows with `_row_exists = 0` are excluded from query results and are physically removed on a later background merge.
+- “On-the-fly mutations” can make UPDATE results visible immediately by storing the update expression in memory and applying it at read time, while the actual part rewrite still runs in the background.
+
+## Settings & knobs
+- Not specified in this chunk (no concrete flags/settings/values mentioned).
+
+## Examples
+```sql
+ALTER TABLE orders
+UPDATE quantity = 60, discount = 0.20
+WHERE order_id = 1001 AND item_id = 'mouse';
+```
+
+```sql
+DELETE FROM orders
+WHERE order_id = 1001 AND item_id = 'mouse';
+-- internally becomes:
+-- ALTER TABLE orders UPDATE _row_exists = 0 WHERE ...
+```
+- Table example used: `ENGINE = MergeTree ORDER BY (order_id, item_id)`.
+
+## Gotchas
+- Mutations are heavyweight: affected columns are rewritten for impacted parts.
+- Visibility delay (classic mutations): changes aren’t visible until the background mutation completes.
+- Execution ordering: mutations must wait for prior merges/mutations to finish (can be surprising).
+- On-the-fly mutations: many accumulated updates can slow `SELECT`.
+- On-the-fly mutations: limited support for subqueries and non-determinism.
+
+## Verification
+- Verify behavior by selecting matching rows before/after the change and confirming:
+  - For classic mutations, results may not change until the background mutation completes.
+  - For on-the-fly mutations, updated values can appear immediately in `SELECT`.
+  - For lightweight deletes, deleted rows are filtered from results once `_row_exists = 0` is applied; physical removal happens on a later background merge.
+
+--- summary 2 ---
+## Practical notes
+- SQL `UPDATE` using patch parts is called a “lightweight update”.
+- In ClickHouse `25.7`, lightweight updates are **experimental**.
+- Updated values become **visible to queries immediately** (no need to wait for background merges).
+- Patch parts store only changed column values plus targeting metadata, and are later applied during background merges.
+
+## Settings & knobs
+- `allow_experimental_lightweight_update = 1`
+- Table setting changes:
+  - `enable_block_number_column = 1`
+  - `enable_block_offset_column = 1`
+- Note: Expected to enter **beta** in `25.8`.
+
+## Examples
+```sql
+SET allow_experimental_lightweight_update = 1;
+
+ALTER TABLE orders
+  MODIFY SETTING enable_block_number_column = 1, enable_block_offset_column = 1;
+
+UPDATE orders
+SET quantity = 60, discount = 0.20
+WHERE order_id = 1001 AND item_id = 'mouse';
+```
+
+```sql
+UPDATE orders
+SET discount = 0.2
+WHERE quantity >= 40;
+```
+- Works with standard SQL `UPDATE` syntax.
+
+## Gotchas
+- `25.7`: lightweight `UPDATE` is **experimental** and must be explicitly enabled.
+- Requires enabling extra table settings (`enable_block_number_column`, `enable_block_offset_column`) before relying on patch-part updates.
+
+## Verification
+```sql
+SELECT *
+FROM orders
+WHERE order_id = 1001 AND item_id = 'mouse';
+```
+- Verify the row reflects new values right after `UPDATE` (immediate visibility claim).
+- For bulk updates (e.g., `quantity >= 40`), spot-check a few qualifying rows to confirm `discount = 0.2`.
+- Confirm settings were applied: `SET allow_experimental_lightweight_update = 1` and the table has the required settings enabled (mechanism/queries not provided in this chunk).
+
+--- summary 3 ---
+## Practical notes
+- UPDATE/DELETE create **patch parts** containing row identifiers + new column values.
+- Updates are **non-blocking**: each UPDATE runs against a **snapshot of parts** present when the UPDATE starts (does not wait for merges).
+- If target parts still exist, patching can be applied efficiently during merges; if parts were merged away first, ClickHouse can still apply the patch using preserved block-based identifiers.
+- DELETE in `lightweight_update` mode becomes “set `_row_exists = 0` via patch part”; rows disappear after a background merge, and queries ignore `_row_exists = 0` in the meantime (“patch-on-read”).
+- Optional: you can fully materialize accumulated changes via `ALTER TABLE … APPLY PATCHES`.
+- Patch parts are regular parts: they count toward `TOO_MANY_PARTS` (per partition) and are cleaned up after materialization/merges.
+
+## Settings & knobs
+- `lightweight_delete_mode = lightweight_update`
+- `update_parallel_mode = auto` (default; serializes dependent updates, runs others in parallel)
+- `update_parallel_mode = sync` (run all updates one at a time)
+
+## Examples
+```sql
+-- DELETE as patch part (lightweight_update mode): marks rows as deleted until merged away
+DELETE FROM t WHERE /* predicate */ ;
+```
+
+```sql
+-- Optional: force materialization of accumulated patch parts into data parts
+ALTER TABLE t APPLY PATCHES;
+```
+- UPDATE patch parts store “updated columns = new values” plus system metadata to target the original rows.
+
+## Gotchas
+- If affected source parts are merged before the patch is applied, ClickHouse may fall back to a **hash join** on `(_block_number, _block_offset)`, which is **slower** and **more memory-hungry** (patch must fit in memory).
+- Patch parts **increase part counts** and can hit `TOO_MANY_PARTS` (per partition).
+- Multiple UPDATEs affecting different column sets create **separate patch partitions** (partitioned by the set of updated columns), which changes how part counts accrue.
+- Concurrent updates: if two updates touch the same columns, ClickHouse enforces correct ordering automatically; `update_parallel_mode` can change concurrency.
+
+## Verification
+```sql
+-- If you need to ensure patch parts are fully materialized
+ALTER TABLE t APPLY PATCHES;
+```
+- After a lightweight-update DELETE, queries should stop returning deleted rows immediately (they’re ignored when `_row_exists = 0`), even before the next merge.
+- Confirm background merges have run if you expect physical row removal (row disappears after merge).
+- If you suspect “slow path” patching, check memory pressure during updates that occur while merges remove the original parts (chunk notes this can happen but “rarely”).
+
+--- summary 4 ---
+## Practical notes
+- `async` mode: runs all updates with no coordination.
+- Default behavior is described as “fast, safe,” and generally correct for most workloads.
+- Coordination is automatic/transparent to the operator; updates “feel like SQL”.
+
+## Settings & knobs
+- `update_sequential_consistency = 0` (off by default)
+- `update_sequential_consistency = 1` ensures each update sees the latest visible state (performance cost).
+- `async` (mode): no coordination (exact setting name/value not specified in this chunk).
+
+## Examples
+```sql
+UPDATE orders
+SET discount = 0.2
+WHERE quantity >= 40;
+```
+- Standard SQL `UPDATE ... SET ... WHERE ...` is supported (example shown).
+
+## Gotchas
+- `update_sequential_consistency` has a performance cost when enabled.
+- `async` updates have “no coordination” (may matter for ordering/visibility expectations; details not specified here).
+
+## Verification
+- Verify via normal query reads after the `UPDATE` (specific verification queries not provided in this chunk).
+- If using `update_sequential_consistency = 1`, expect updates to reflect the latest visible state per update.
+- If using `async`, don’t assume coordinated/serialized update visibility across concurrent updates (details not specified here).
+
+
+mcp: gh-demo starting
+mcp: ai-demo starting
+mcp: gh-mcp starting
+mcp: gh-demo ready
+mcp: ai-demo ready
+mcp: gh-mcp ready
+mcp startup: ready: gh-demo, ai-demo, gh-mcp
+codex
+## ClickHouse UPDATE/DELETE: practical how-to
+
+### 1) Pick the mechanism you’re using
+- **Classic mutation (MergeTree):** `ALTER TABLE … UPDATE` / `ALTER TABLE … DELETE` (mutation-based). Runs **asynchronously**; results may not be visible until the background mutation finishes. Heavyweight because affected columns are rewritten for matching parts.
+- **On-the-fly mutations:** can make updates **visible immediately** by applying expressions at read time while parts rewrite in the background; too many accumulated updates can slow `SELECT` and has limits around subqueries/non-determinism.
+- **Lightweight UPDATE/DELETE (patch parts):** SQL `UPDATE … SET … WHERE …` and `DELETE … WHERE …` create **patch parts** (row identifiers + new values). Visibility is **immediate to queries** (“patch-on-read”), with later background merges/materialization applying changes to data parts.
+
+### 2) Enable lightweight UPDATE if you’re on ClickHouse 25.7
+In **25.7**, lightweight updates are **experimental** (expected **beta** in **25.8**) and must be enabled, plus table settings:
+```sql
+SET allow_experimental_lightweight_update = 1;
+
+ALTER TABLE orders
+  MODIFY SETTING enable_block_number_column = 1, enable_block_offset_column = 1;
+```
+
+### 3) Run UPDATE / DELETE
+**UPDATE (standard SQL syntax):**
+```sql
+UPDATE orders
+SET quantity = 60, discount = 0.20
+WHERE order_id = 1001 AND item_id = 'mouse';
+```
+
+**DELETE (lightweight-update mode uses `_row_exists = 0` via patch parts):**
+```sql
+DELETE FROM t
+WHERE /* predicate */ ;
+```
+
+### 4) Optional operational knobs (ordering/concurrency/consistency)
+- `update_parallel_mode`:
+  - `auto` (default): serializes dependent updates; runs others in parallel.
+  - `sync`: runs updates one at a time.
+- `update_sequential_consistency = 1`: each update sees the latest visible state (performance cost). Default is `0`.
+- `lightweight_delete_mode = lightweight_update`: makes `DELETE` behave as patch-part delete (`_row_exists = 0`) until merged/materialized.
+
+### 5) Materialize patch parts when needed
+If patch parts accumulate and you want to force them into data parts:
+```sql
+ALTER TABLE t APPLY PATCHES;
+```
+
+### 6) Key gotchas to plan for
+- Patch parts are **regular parts** and can contribute to `TOO_MANY_PARTS` (per partition); they’re cleaned up after materialization/merges.
+- If original parts get merged away before patch application, ClickHouse may fall back to a **hash join** on `(_block_number, _block_offset)`, which is slower and more memory-hungry (patch must fit in memory).
+- Multiple UPDATEs touching different column sets can create separate patch-part groupings (part counts can rise in unexpected ways).
+
+## Verification
+- Check row visibility immediately after UPDATE:
+```sql
+SELECT *
+FROM orders
+WHERE order_id = 1001 AND item_id = 'mouse';
+```
+- For broad predicates, spot-check a few qualifying rows (e.g., `WHERE quantity >= 40`) to confirm changes.
+- For lightweight deletes, confirm queries no longer return deleted rows right away (ignored via `_row_exists = 0`), and run `ALTER TABLE … APPLY PATCHES` if you need to ensure changes are fully materialized.
+tokens used
+10,394
+## ClickHouse UPDATE/DELETE: practical how-to
+
+### 1) Pick the mechanism you’re using
+- **Classic mutation (MergeTree):** `ALTER TABLE … UPDATE` / `ALTER TABLE … DELETE` (mutation-based). Runs **asynchronously**; results may not be visible until the background mutation finishes. Heavyweight because affected columns are rewritten for matching parts.
+- **On-the-fly mutations:** can make updates **visible immediately** by applying expressions at read time while parts rewrite in the background; too many accumulated updates can slow `SELECT` and has limits around subqueries/non-determinism.
+- **Lightweight UPDATE/DELETE (patch parts):** SQL `UPDATE … SET … WHERE …` and `DELETE … WHERE …` create **patch parts** (row identifiers + new values). Visibility is **immediate to queries** (“patch-on-read”), with later background merges/materialization applying changes to data parts.
+
+### 2) Enable lightweight UPDATE if you’re on ClickHouse 25.7
+In **25.7**, lightweight updates are **experimental** (expected **beta** in **25.8**) and must be enabled, plus table settings:
+```sql
+SET allow_experimental_lightweight_update = 1;
+
+ALTER TABLE orders
+  MODIFY SETTING enable_block_number_column = 1, enable_block_offset_column = 1;
+```
+
+### 3) Run UPDATE / DELETE
+**UPDATE (standard SQL syntax):**
+```sql
+UPDATE orders
+SET quantity = 60, discount = 0.20
+WHERE order_id = 1001 AND item_id = 'mouse';
+```
+
+**DELETE (lightweight-update mode uses `_row_exists = 0` via patch parts):**
+```sql
+DELETE FROM t
+WHERE /* predicate */ ;
+```
+
+### 4) Optional operational knobs (ordering/concurrency/consistency)
+- `update_parallel_mode`:
+  - `auto` (default): serializes dependent updates; runs others in parallel.
+  - `sync`: runs updates one at a time.
+- `update_sequential_consistency = 1`: each update sees the latest visible state (performance cost). Default is `0`.
+- `lightweight_delete_mode = lightweight_update`: makes `DELETE` behave as patch-part delete (`_row_exists = 0`) until merged/materialized.
+
+### 5) Materialize patch parts when needed
+If patch parts accumulate and you want to force them into data parts:
+```sql
+ALTER TABLE t APPLY PATCHES;
+```
+
+### 6) Key gotchas to plan for
+- Patch parts are **regular parts** and can contribute to `TOO_MANY_PARTS` (per partition); they’re cleaned up after materialization/merges.
+- If original parts get merged away before patch application, ClickHouse may fall back to a **hash join** on `(_block_number, _block_offset)`, which is slower and more memory-hungry (patch must fit in memory).
+- Multiple UPDATEs touching different column sets can create separate patch-part groupings (part counts can rise in unexpected ways).
+
+## Verification
+- Check row visibility immediately after UPDATE:
+```sql
+SELECT *
+FROM orders
+WHERE order_id = 1001 AND item_id = 'mouse';
+```
+- For broad predicates, spot-check a few qualifying rows (e.g., `WHERE quantity >= 40`) to confirm changes.
+- For lightweight deletes, confirm queries no longer return deleted rows right away (ignored via `_row_exists = 0`), and run `ALTER TABLE … APPLY PATCHES` if you need to ensure changes are fully materialized.

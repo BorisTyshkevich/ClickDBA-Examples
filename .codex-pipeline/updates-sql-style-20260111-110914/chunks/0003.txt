@@ -1,0 +1,133 @@
+Each patch part row includes just enough metadata to find the row it updates: 
+System column(s) Purpose _part , _part_offset Identify the original row _block_number , _block_offset Support tracking through merges ( not used here ) _data_version Track the update version: used to skip already-applied patches and merge patch parts with other patch parts ( explained later ) 
+The rest is just: 
+<updated columns >New values that replace old ones (e.g. discount = 0.2 ) 
+Patch part indexes #
+
+Once the patch part exists, ClickHouse needs to know when and where to apply it. For that, it builds two lightweight indexes (per patch part), one forward, one reverse: 
+Index name Purpose Source part index Maps each affected source part to the min/max data version. Used to ask: Should I apply this patch to this part? Reverse index Maps the patch 's data version to all parts and blocks that need it. Used to find patch targets even after merges. 
+These indexes enable efficient targeting even when data parts are merged in the background.
+
+Fast source part matching via index #
+
+ClickHouse uses the patch part’s source part index to quickly determine which source parts the update applies to. In our example, only all_1_1_0 and all_3_3_0 match, the update doesn’t touch all_2_2_0 .
+
+Fast patch merge via system column–driven sorting #
+
+As explained earlier, patch parts piggyback on merges already running in the background . Since all parts are sorted by _part_offset (either implicitly or explicitly), ClickHouse can apply the patch in a single, efficient merge pass .
+
+Preserving row identity during merges #
+
+In the merged part (⑤), _part_offset values are recreated to reflect each row’s new position. But _block_number and _block_offset are copied over unchanged from the original parts.
+
+This detail is crucial for supporting updates that run concurrently with merges of the affected parts.
+
+Let’s explore how that works in the next section.
+
+Updates don’t wait for merges #
+
+ClickHouse updates are non-blocking : they don’t wait for merges to finish. Instead, each update runs against a snapshot of the parts that exist when the UPDATE begins.
+
+Classic mutations must wait for prior merges and mutations to finish before they run.
+
+In most cases, that snapshot is still valid when the patch part is later applied. But if those parts are merged away before that happens, ClickHouse automatically falls back to a different matching strategy.
+
+Let’s look at how that fallback works.
+
+What happens if the parts are merged before a patch is applied? #
+
+The next diagram picks up the same extended example from the previous section, but shows what happens when the parts are merged before the patch is applied.
+
+In the previous diagram, we dimmed _block_number and _block_offset . This time, we dim (show in light gray) _part , _part_offset , and the patch’s source part index ; they’re not used here.
+
+What changes in this scenario?
+
+①–③ : The same inserts and ⑤ UPDATE run as before, those steps are unchanged.
+
+④ : But this time, a background merge combines the original parts into a single part before the patch can be applied. The source parts (①–③) are then removed, as usual for merges.
+
+⑤ : The original _part and _part_offset values referenced by the patch part are no longer valid. So ClickHouse falls back to _block_number and _block_offset , which are preserved during merges.
+
+⑥–⑧ : ClickHouse applies the patch using a hash join based on those preserved values, producing a merged data part with the patch applied.
+
+Let’s take a closer look at how that fallback patching path works.
+
+Source part matching via reverse index #
+
+The reverse index shows that this patch applies to data version 4 , and targets parts all_1_1_0 and all_3_3_0 , which (based on their names ) contained block numbers 1 and 3 .
+
+The merged part all_1_3_1 (based on its name) spans block numbers 1 to 3 , so it’s a valid match. Also, its data version is 1 (inferred from its lowest block number), which is less than the patch’s version 4 , so the patch can be applied.
+
+This reverse mapping lets ClickHouse match and patch data even after merges invalidate the original part names.
+
+Patch application via join on block-based system columns #
+
+We can’t use _part and _part_offset anymore to efficiently apply the patch in a merge, since the source parts are gone and their original values no longer match the corresponding rows in the merged output.
+
+Instead, ClickHouse applies the patch using a hash join-based algorithm , loading the patch part into memory as a hash table keyed by (_block_number, _block_offset) , and joins it with the merged part using the same key to update the rows.
+
+This fallback is slower and more memory-hungry than the fast path in the previous section. The patch must fit entirely in memory, but in the future, ClickHouse may support a full merge join that isn’t memory-bound, though that’s not yet implemented.
+
+Thankfully, this rarely happens in practice, since the source data parts usually live long enough for fast patching.
+
+Now that we’ve seen how ClickHouse handles UPDATEs, even during merges, let’s talk about how DELETEs have gotten just as efficient.
+
+Featherweight DELETEs #
+
+In Stage 1.5 , lightweight DELETEs already gave us a win: they rewrote only the _row_exists deletion mask via an ALTER UPDATE, avoiding full-row rewrites.
+
+But we can go even lighter.
+
+When lightweight_delete_mode = lightweight_update , DELETEs aren’t ALTERs at all. ClickHouse simply creates a patch part that sets _row_exists = 0 for the deleted rows. The rows are then dropped during the next background merge.
+
+The diagram below reuses the same example from Stage 1.5: we delete the mouse item from the original order. ( Unused system columns like _block_number, _block_offset, etc. are omitted for clarity. )
+
+① The initial part contains two rows.
+
+② A patch part sets _row_exists = 0 for the deleted row (the mouse).
+
+③ During the next merge, that row disappears.
+
+ClickHouse applies the patch instantly. Until the merge happens, queries simply ignore rows where _row_exists = 0 . This is the heart of patch-on-read query execution .
+
+How patch-on-read works #
+
+ClickHouse doesn’t wait to materialize patch parts before returning updated results. Instead:
+
+Patch parts are applied automatically and on the fly in memory during query execution, like an implicit FINAL .
+
+This patch-on-read mechanism is designed to minimize performance impact.
+
+Usually, the data selected for a query (after index analysis ) is located in several data ranges (consecutive blocks of rows) in several data parts. These ranges are dynamically spread by the query engine across ① separate and parallel stream stages (data streams) and then processed by ② parallel processing lanes that filter, aggregate, sort, and limit the data into its final result:
+
+Not-yet-merged patch parts are ③ matched and applied independently for each data range in each data stream, ensuring that updates are applied correctly without disrupting parallelism.
+
+(If needed, you can fully materialize all accumulated not-yet-merged changes with ALTER TABLE … APPLY PATCHES , but that’s optional.)
+
+To fully understand patch parts, we also need to look at their lifecycle: how ClickHouse merges, deduplicates, and cleans them up in the background.
+
+What happens to patch parts over time? #
+
+Patch parts may seem special, but under the hood, they’re just regular parts in ClickHouse. That means:
+
+They are merged with other patch parts using the ReplacingMergeTree algorithm, with _data_version as a version column . This ensures each patch part stores only the latest version of each updated row.
+
+They’re automatically cleaned up once their changes are fully materialized into all affected data parts, or when merged with another patch part. Background cleanup threads handle this safely.
+
+They count toward the TOO_MANY_PARTS threshold , which applies per partition . To mitigate this, patch parts are stored in separate partitions based on the set of updated columns . So if you run multiple UPDATE statements that affect different columns, like SET x = … , SET y = … , and SET x = …, y = … , you’ll get separate patch partitions, each with its own part count.
+
+This design keeps patch parts fast, efficient, and deeply integrated with MergeTree mechanics.
+
+So far, we’ve focused on how patch parts behave in isolation. But what happens when multiple updates arrive at the same time? Let’s look at how ClickHouse coordinates concurrent updates safely.
+
+Coordinating concurrent updates #
+
+ClickHouse runs updates in parallel by default. If two updates touch the same columns, it automatically runs them in the correct order. You don’t need to configure anything; it just works.
+
+You can tweak this behavior with a few settings:
+
+update_parallel_mode :
+
+auto (default): Serializes dependent updates (e.g. UPDATE a=3 WHERE b=2 and UPDATE b=2 WHERE a=1 ). Runs others in parallel.
+
+sync : Runs all updates one at a time.
