@@ -8,4 +8,4 @@ Verify schema, queries, and settings for the correct usage of the new patch UPDA
 Compare update/delete queries to different tables and try to find the difference. show examples for the subsequent discussion.
 Create a separate report related LOGICAL_ERROR problem.
 - Run a comprehensive analysis of clickhouse server performance for yesterday. The server is accessible over clickhouse-client (no params needed).  Look for errors, explore select and insert query performance, ingestion behaviour, problems with merges and mutations.  If errors are found, go deeper and find a root cause. Search GitHub for relevant issues. Write all findings and recommendations into md file. Investigate in detail all MEMORY_LIMIT_EXCEEDED errors
-
+- Please draw ERD of fhir database at ai-demo connector as Mermaid diagram
